@@ -4,164 +4,179 @@ import asyncio
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
-from config import TOKEN, API_URL
+from bs4 import BeautifulSoup
+from config import TOKEN
+
+# URL сайта для парсинга расписания
+BASE_URL = "https://digital.etu.ru/schedule/"
 
 # Инициализация бота
 bot = Bot(token=TOKEN)
 router = Router()
 
-# Сохранение номера группы пользователя (в упрощенном варианте)
-user_group = {}
-
-# Функция для получения расписания по API
-def get_schedule(group_number, week_number=None, day=None):
-    url = f"{API_URL}{group_number}/"
-    params = {}
-
-    if week_number:
-        params['week'] = week_number
-    if day:
-        params['day'] = day
-
-    response = requests.get(url, params=params)
-
-    if response.status_code == 200:
-        return response.json()  # Возвращает расписание в виде JSON
-    else:
-        return None
+# Сохранение номера группы и курса пользователя
+user_data = {}
 
 
+# Функция для парсинга расписания
+def fetch_schedule(course, faculty):
+    """
+    Парсит расписание с сайта digital.etu.ru
+    :param course: Курс (1, 2, 3 и т.д.)
+    :param faculty: Факультет
+    :return: JSON с расписанием
+    """
+    params = {"course": course, "schedule": faculty}
+    response = requests.get(BASE_URL, params=params)
+
+    if response.status_code != 200:
+        return {"error": "Не удалось подключиться к сайту"}
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    table = soup.find("table", {"class": "table"})  # Таблица с расписанием
+
+    if not table:
+        return {"error": "Не удалось найти расписание на странице"}
+
+    schedule_data = []
+    for row in table.find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) >= 4:
+            schedule_data.append({
+                "time": cells[0].text.strip(),
+                "subject": cells[1].text.strip(),
+                "teacher": cells[2].text.strip(),
+                "room": cells[3].text.strip(),
+            })
+
+    return {"schedule": schedule_data}
+
+
+# Команда /start
 @router.message(Command(commands=["start"]))
 async def start(message: Message):
-    user_group[message.from_user.id] = None  # Сбрасываем номер группы при новом старте
+    user_data[message.from_user.id] = {"course": None, "faculty": None}
+    await message.answer(
+        "Привет! Я бот для получения расписания ЛЭТИ.\n"
+        "Введите номер вашего курса (1, 2, 3 и т.д.):"
+    )
 
-    # Исправление: передача текста через параметр text
-    button_cancel = KeyboardButton(text="/cancel")
+
+# Ввод номера курса
+@router.message(lambda message: user_data.get(message.from_user.id, {}).get("course") is None)
+async def handle_course_number(message: Message):
+    try:
+        course = int(message.text.strip())
+        if course not in [1, 2, 3, 4]:  # Допустимые курсы
+            raise ValueError
+        user_data[message.from_user.id]["course"] = course
+        await message.answer(
+            "Введите название факультета (например, ИТИ, РТФ, ФЭЭ):"
+        )
+    except ValueError:
+        await message.answer("Пожалуйста, введите корректный номер курса (1, 2, 3 или 4).")
+
+
+# Ввод факультета
+@router.message(lambda message: user_data.get(message.from_user.id, {}).get("faculty") is None)
+async def handle_faculty_name(message: Message):
+    faculty = message.text.strip().upper()  # Приводим название к верхнему регистру
+    user_data[message.from_user.id]["faculty"] = faculty
 
     # Создаем клавиатуру
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[button_cancel]],
-        resize_keyboard=True
-    )
-
-    await message.answer(
-        "Привет! Я бот для получения расписания ЛЭТИ.\nВведите номер вашей группы:",
-        reply_markup=keyboard
-    )
-
-
-# Обработка ввода номера группы
-@router.message(lambda message: user_group.get(message.from_user.id) is None)
-async def handle_group_number(message: Message):
-    group_number = message.text.strip()
-
-    # Сохраняем номер группы
-    user_group[message.from_user.id] = group_number
-
-    # Создаем клавиатуру с кнопками действий
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Следующая пара")],
             [KeyboardButton(text="Расписание на день")],
             [KeyboardButton(text="Расписание на неделю")],
-            [KeyboardButton(text="Расписание на завтра")]
+            [KeyboardButton(text="Расписание на завтра")],
         ],
         resize_keyboard=True
     )
 
-    await message.answer(f"Группа {group_number} сохранена. Выберите действие:", reply_markup=keyboard)
+    await message.answer(
+        f"Курс и факультет сохранены: {user_data[message.from_user.id]['course']} курс, {faculty}.\n"
+        "Выберите действие:",
+        reply_markup=keyboard
+    )
 
 
 # Обработчик кнопки "Следующая пара"
 @router.message(lambda message: message.text == "Следующая пара")
 async def near_lesson(message: Message):
-    group_number = user_group.get(message.from_user.id)
-    if not group_number:
-        await message.answer("Сначала введите номер группы с помощью команды /start.")
+    user = user_data.get(message.from_user.id)
+    if not user or not user.get("course") or not user.get("faculty"):
+        await message.answer("Сначала введите данные с помощью команды /start.")
         return
 
-    today = datetime.date.today()
-    week_number = 1 if today.isocalendar()[1] % 2 == 1 else 2
+    schedule = fetch_schedule(user["course"], user["faculty"])
+    if "error" in schedule:
+        await message.answer(schedule["error"])
+        return
 
-    schedule = get_schedule(group_number, week_number)
-    if schedule and "next_lesson" in schedule:
-        next_lesson = schedule["next_lesson"]
-        await message.answer(f"Ближайшее занятие:\n{next_lesson}")
+    lessons = schedule.get("schedule", [])
+    if lessons:
+        next_lesson = lessons[0]  # Берем первое занятие как ближайшее
+        await message.answer(
+            f"Ближайшее занятие:\n"
+            f"{next_lesson['time']} - {next_lesson['subject']}\n"
+            f"Преподаватель: {next_lesson['teacher']}\n"
+            f"Аудитория: {next_lesson['room']}"
+        )
     else:
-        await message.answer("Не удалось найти расписание для вашей группы.")
+        await message.answer("На сегодня занятий больше нет.")
 
 
 # Обработчик кнопки "Расписание на день"
 @router.message(lambda message: message.text == "Расписание на день")
 async def day_schedule(message: Message):
-    group_number = user_group.get(message.from_user.id)
-    if not group_number:
-        await message.answer("Сначала введите номер группы с помощью команды /start.")
+    user = user_data.get(message.from_user.id)
+    if not user or not user.get("course") or not user.get("faculty"):
+        await message.answer("Сначала введите данные с помощью команды /start.")
         return
 
-    today = datetime.date.today().strftime("%Y-%m-%d")
-    schedule = get_schedule(group_number, day=today)
+    schedule = fetch_schedule(user["course"], user["faculty"])
+    if "error" in schedule:
+        await message.answer(schedule["error"])
+        return
 
-    if schedule:
-        lessons = schedule.get("lessons", [])
-        if lessons:
-            schedule_text = "\n".join([f"{lesson['time']} - {lesson['subject']}" for lesson in lessons])
-            await message.answer(f"Расписание на сегодня:\n{schedule_text}")
-        else:
-            await message.answer("Сегодня занятий нет.")
+    lessons = schedule.get("schedule", [])
+    if lessons:
+        schedule_text = "\n".join(
+            [f"{lesson['time']} - {lesson['subject']} ({lesson['room']})" for lesson in lessons]
+        )
+        await message.answer(f"Расписание на сегодня:\n{schedule_text}")
     else:
-        await message.answer("Не удалось найти расписание для вашей группы.")
+        await message.answer("Сегодня занятий нет.")
 
 
 # Обработчик кнопки "Расписание на неделю"
 @router.message(lambda message: message.text == "Расписание на неделю")
 async def week_schedule(message: Message):
-    group_number = user_group.get(message.from_user.id)
-    if not group_number:
-        await message.answer("Сначала введите номер группы с помощью команды /start.")
+    user = user_data.get(message.from_user.id)
+    if not user or not user.get("course") or not user.get("faculty"):
+        await message.answer("Сначала введите данные с помощью команды /start.")
         return
 
-    today = datetime.date.today()
-    week_number = 1 if today.isocalendar()[1] % 2 == 1 else 2
+    schedule = fetch_schedule(user["course"], user["faculty"])
+    if "error" in schedule:
+        await message.answer(schedule["error"])
+        return
 
-    schedule = get_schedule(group_number, week_number=week_number)
-    if schedule:
-        lessons = schedule.get("lessons", [])
-        if lessons:
-            schedule_text = "\n".join([f"{lesson['day']} {lesson['time']} - {lesson['subject']}" for lesson in lessons])
-            await message.answer(f"Расписание на неделю:\n{schedule_text}")
-        else:
-            await message.answer("На этой неделе занятий нет.")
+    lessons = schedule.get("schedule", [])
+    if lessons:
+        schedule_text = "\n".join(
+            [f"{lesson['time']} - {lesson['subject']} ({lesson['room']})" for lesson in lessons]
+        )
+        await message.answer(f"Расписание на неделю:\n{schedule_text}")
     else:
-        await message.answer("Не удалось найти расписание для вашей группы.")
+        await message.answer("На этой неделе занятий нет.")
 
 
 # Обработчик кнопки "Расписание на завтра"
 @router.message(lambda message: message.text == "Расписание на завтра")
 async def tomorrow_schedule(message: Message):
-    group_number = user_group.get(message.from_user.id)
-    if not group_number:
-        await message.answer("Сначала введите номер группы с помощью команды /start.")
-        return
-
-    tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-    schedule = get_schedule(group_number, day=tomorrow)
-
-    if schedule:
-        lessons = schedule.get("lessons", [])
-        if lessons:
-            schedule_text = "\n".join([f"{lesson['time']} - {lesson['subject']}" for lesson in lessons])
-            await message.answer(f"Расписание на завтра:\n{schedule_text}")
-        else:
-            await message.answer("Завтра занятий нет.")
-    else:
-        await message.answer("Не удалось найти расписание для вашей группы.")
-
-
-# Обработчик команды /cancel
-@router.message(Command(commands=["cancel"]))
-async def cancel(message: Message):
-    await message.answer("Вы отменили операцию. Для начала работы используйте /start.")
+    await message.answer("Эта функция пока в разработке.")
 
 
 # Запуск бота
